@@ -1,36 +1,37 @@
 set -x
 ENGINE=${1:-vllm}
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # export VLLM_ATTENTION_BACKEND=XFORMERS
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 PROJECT_DIR="$(pwd)"
-MODEL_NAME="Qwen3-4B"
-CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints/gigpo_alfworld_${MODEL_NAME}"
+MODEL_NAME="Qwen2.5-VL-3B-Instruct"
+CHECKPOINT_DIR="${PROJECT_DIR}/checkpoints/forge_sokoban_${MODEL_NAME}"
 
-num_cpus_per_env_worker=0.1 # The CPU resource allocated for each environment worker. If you want to use less CPU resources, you can decrease this value.
+num_cpus_per_env_worker=0.1
 
-train_data_size=16
+train_data_size=32
 val_data_size=128
 group_size=8
-mode="mean_std_norm" # "mean_norm" or "mean_std_norm"
+mode="mean_norm"  # "mean_norm" or "mean_std_norm"
 
-# We only use data preparation to indicate the modality and the data size.
+# Data preparation (visual mode for Sokoban)
 python3 -m examples.data_preprocess.prepare \
-    --mode 'text' \
+    --mode 'visual' \
     --train_data_size $train_data_size \
     --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=gigpo \
-    data.train_files=$HOME/data/verl-agent/text/train.parquet \
-    data.val_files=$HOME/data/verl-agent/text/test.parquet \
+    algorithm.adv_estimator=forge \
+    data.train_files=$HOME/data/verl-agent/visual/train.parquet \
+    data.val_files=$HOME/data/verl-agent/visual/test.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=2048 \
+    data.max_prompt_length=1024 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
+    data.image_key=images \
     data.return_raw_chat=True \
-    actor_rollout_ref.model.path=Qwen/Qwen3-4B \
+    actor_rollout_ref.model.path=Qwen/$MODEL_NAME \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
@@ -56,22 +57,30 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     algorithm.use_kl_in_reward=False \
     algorithm.gamma=0.95 \
-    algorithm.gigpo.step_advantage_w=1.0 \
-    algorithm.gigpo.mode=$mode \
-    env.env_name=alfworld/AlfredTWEnv \
+    algorithm.forge.use_step_rewards=True \
+    algorithm.forge.step_advantage_w=1.0 \
+    algorithm.forge.mode=$mode \
+    algorithm.forge.success_threshold=0.5 \
+    algorithm.forge.golden_capacity_per_level=100 \
+    algorithm.forge.warning_capacity_per_level=50 \
+    algorithm.forge.divergence_type=jsd \
+    algorithm.forge.distill_temperature=1.0 \
+    algorithm.forge.library_save_freq=10 \
+    algorithm.forge.checkpoint_dir=${CHECKPOINT_DIR}/library \
+    env.env_name=Sokoban \
     env.seed=0 \
-    env.max_steps=50 \
+    env.max_steps=15 \
     env.rollout.n=$group_size \
+    env.sokoban.mode='rgb_array' \
     env.resources_per_worker.num_cpus=$num_cpus_per_env_worker \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl_agent_alfworld_cyclic' \
-    trainer.experiment_name="gigpo_${MODEL_NAME}" \
+    trainer.project_name='verl_agent_sokoban_forge' \
+    trainer.experiment_name="forge_${MODEL_NAME}" \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=2 \
+    trainer.save_freq=10 \
     trainer.test_freq=5 \
-    trainer.total_epochs=50 \
+    trainer.total_epochs=150 \
     trainer.default_local_dir=${CHECKPOINT_DIR} \
-    trainer.resume_mode=auto \
     trainer.val_before_train=False $@

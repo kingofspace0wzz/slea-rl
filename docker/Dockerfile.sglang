@@ -7,6 +7,9 @@ ENV MAX_JOBS=32
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_OPTIONS=""
 
+# Set working directory to workspace root (parent of docker folder)
+WORKDIR /app/workspace
+
 # Define installation arguments
 ARG APT_SOURCE=https://mirrors.ustc.edu.cn/ubuntu/
 

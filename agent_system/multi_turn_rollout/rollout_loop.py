@@ -27,18 +27,20 @@ from typing import List, Dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 class TrajectoryCollector:
-    def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
+    def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None, step_experience_manager=None):
         """
         Initialize the TrajectoryProcessor class.
-        
+
         Parameters:
             config: Configuration object containing data processing settings
             tokenizer (PreTrainedTokenizer): Tokenizer for text encoding and decoding
             processor: Image processor for multimodal inputs
+            step_experience_manager: Optional FORGE step experience manager for experience-augmented rollouts
         """
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        self.step_experience_manager = step_experience_manager  # For FORGE experience augmentation
 
     def preprocess_single_sample(
         self,
@@ -86,11 +88,33 @@ class TrajectoryCollector:
         else:
             print(f"Warning: No text observation found!")
 
-        
-        chat = np.array([{
-            "content": obs_content,
-            "role": "user",
-        }])
+        # FORGE: Augment observation with retrieved experiences (multi-turn specific)
+        # Experiences are injected as a separate system hint BEFORE the observation,
+        # keeping the observation format intact to avoid corrupting valid action generation.
+        experience_hint = None
+        if self.step_experience_manager is not None and obs_content:
+            task_type = self.config.env.get('env_name', None)
+            retrieved = self.step_experience_manager.retrieve_for_observation(
+                observation=obs_content,
+                task_type=task_type,
+            )
+            if retrieved['golden'] or retrieved['warning']:
+                experience_hint = self.step_experience_manager._format_experiences(
+                    retrieved, style='minimal'
+                )
+
+        if experience_hint:
+            # Put experiences as a separate system message to avoid corrupting
+            # the observation format that the model expects
+            chat = np.array([
+                {"content": experience_hint, "role": "system"},
+                {"content": obs_content, "role": "user"},
+            ])
+        else:
+            chat = np.array([{
+                "content": obs_content,
+                "role": "user",
+            }])
         
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(

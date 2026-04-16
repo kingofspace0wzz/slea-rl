@@ -61,6 +61,20 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
+from verl.trainer.ppo.cyclic_flex import (
+    core_cyclic_flex,
+    ExperienceBuffer,
+    SleepTrainer,
+    ReflectionGenerator,
+)
+from verl.trainer.ppo.forge import (
+    ExperienceLibrary,
+    ExperienceEvolver,
+    ForgeDistillationManager,
+    StepExperienceManager,
+    core_forge,
+    evolve_library_from_batch,
+)
 
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
@@ -94,6 +108,8 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    CYCLIC_FLEX = 'cyclic_flex'  # Wake-Sleep framework for continuous agent evolution
+    FORGE = 'forge'  # Forward-learning Optimized RL with Guided Experience
 
 
 @dataclass
@@ -357,6 +373,70 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.CYCLIC_FLEX:
+        # Cyclic-FLEX: Wake-Sleep framework for continuous agent evolution
+        # Supports both episode-only and step-level (GiGPO-compatible) advantages
+        use_step_rewards = kwargs.get('cyclic_flex_use_step_rewards', False)
+
+        if use_step_rewards and 'step_rewards' in data.batch:
+            # GiGPO-compatible step-level advantages
+            advantages, returns = core_cyclic_flex.compute_cyclic_flex_with_step_rewards(
+                token_level_rewards=data.batch['token_level_rewards'],
+                step_rewards=data.batch['step_rewards'],
+                response_mask=data.batch['response_mask'],
+                anchor_obs=data.non_tensor_batch.get('anchor_obs', np.array([''] * len(data))),
+                index=data.non_tensor_batch['uid'],
+                traj_index=data.non_tensor_batch['traj_uid'],
+                step_advantage_w=kwargs.get('cyclic_flex_step_advantage_w', 1.0),
+                epsilon=1e-6,
+                norm_by_std=kwargs.get('cyclic_flex_norm_by_std', True),
+                enable_similarity=kwargs.get('cyclic_flex_enable_similarity', False),
+                similarity_thresh=kwargs.get('cyclic_flex_similarity_thresh', 0.95),
+            )
+        else:
+            # Episode-only advantages (GRPO-style)
+            advantages, returns = core_cyclic_flex.compute_cyclic_flex_advantage(
+                token_level_rewards=data.batch['token_level_rewards'],
+                response_mask=data.batch['response_mask'],
+                index=data.non_tensor_batch['uid'],
+                traj_index=data.non_tensor_batch['traj_uid'],
+                epsilon=1e-6,
+                norm_by_std=kwargs.get('cyclic_flex_norm_by_std', True),
+            )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.FORGE:
+        # FORGE: Forward-learning Optimized RL with Guided Experience
+        # Uses GiGPO-style multi-level advantages with experience evolution
+        use_step_rewards = kwargs.get('forge_use_step_rewards', True)
+
+        if use_step_rewards and 'step_rewards' in data.batch:
+            # GiGPO-compatible step-level advantages
+            advantages, returns = core_forge.compute_forge_advantage(
+                token_level_rewards=data.batch['token_level_rewards'],
+                step_rewards=data.batch['step_rewards'],
+                response_mask=data.batch['response_mask'],
+                anchor_obs=data.non_tensor_batch.get('anchor_obs', np.array([''] * len(data))),
+                index=data.non_tensor_batch['uid'],
+                traj_index=data.non_tensor_batch['traj_uid'],
+                step_advantage_w=kwargs.get('forge_step_advantage_w', 1.0),
+                epsilon=1e-6,
+                mode=kwargs.get('forge_mode', 'mean_norm'),
+                enable_similarity=kwargs.get('forge_enable_similarity', False),
+                similarity_thresh=kwargs.get('forge_similarity_thresh', 0.95),
+            )
+        else:
+            # Episode-only advantages (GRPO-style)
+            advantages, returns = core_forge.compute_forge_episode_only_advantage(
+                token_level_rewards=data.batch['token_level_rewards'],
+                response_mask=data.batch['response_mask'],
+                index=data.non_tensor_batch['uid'],
+                traj_index=data.non_tensor_batch['traj_uid'],
+                epsilon=1e-6,
+                norm_by_std=kwargs.get('forge_norm_by_std', True),
+            )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -451,11 +531,78 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            AdvantageEstimator.CYCLIC_FLEX,  # Critic-free like GRPO/GiGPO
+            AdvantageEstimator.FORGE,  # Critic-free with experience evolution
         ]:
             self.use_critic = False
         else:
             raise NotImplementedError
+
+        # Initialize Cyclic-FLEX components if using this estimator
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.CYCLIC_FLEX:
+            cyclic_config = self.config.algorithm.get('cyclic_flex', {})
+            self.experience_buffer = ExperienceBuffer(
+                capacity=cyclic_config.get('buffer_capacity', 100),
+                retrieval_k=cyclic_config.get('retrieval_k', 5),
+                min_score_threshold=cyclic_config.get('min_score_threshold', 0.0),
+            )
+            self.sleep_trainer = SleepTrainer(
+                lora_rank=cyclic_config.get('lora_rank', 16),
+                lora_alpha=cyclic_config.get('lora_alpha', 32),
+                lora_dropout=cyclic_config.get('lora_dropout', 0.05),
+                target_modules=cyclic_config.get('target_modules', ['q_proj', 'v_proj']),
+                learning_rate=cyclic_config.get('learning_rate', 2e-5),
+                epochs=cyclic_config.get('sleep_epochs', 2),
+                batch_size=cyclic_config.get('sleep_batch_size', 4),
+                warmup_ratio=cyclic_config.get('warmup_ratio', 0.1),
+                merge_after_training=cyclic_config.get('merge_after_training', True),
+                checkpoint_dir=cyclic_config.get('checkpoint_dir', 'checkpoints/cyclic_flex'),
+            )
+            self.reflection_generator = ReflectionGenerator(
+                use_llm=cyclic_config.get('use_llm_reflection', False),
+                env_name=self.config.env.env_name,
+            )
+            self.sleep_cycle_count = 0
+            print(f"[Cyclic-FLEX] Initialized with buffer_capacity={cyclic_config.get('buffer_capacity', 100)}")
+
+        # Initialize FORGE components if using this estimator
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.FORGE:
+            forge_config = self.config.algorithm.get('forge', {})
+            self.experience_library = ExperienceLibrary(
+                golden_capacity_per_level=forge_config.get('golden_capacity_per_level', 100),
+                warning_capacity_per_level=forge_config.get('warning_capacity_per_level', 50),
+                use_embeddings=forge_config.get('use_embeddings', False),
+            )
+            self.experience_evolver = ExperienceEvolver(
+                library=self.experience_library,
+                similarity_threshold=forge_config.get('similarity_threshold', 0.85),
+                min_score_threshold=forge_config.get('success_threshold', 0.5),
+            )
+            # Step-level experience manager for multi-turn (KEY INNOVATION)
+            self.step_experience_manager = StepExperienceManager(
+                library=self.experience_library,
+                top_k_golden=forge_config.get('top_k_golden', 2),
+                top_k_warning=forge_config.get('top_k_warning', 1),
+                max_experience_length=forge_config.get('max_experience_length', 800),
+                retrieval_mode=forge_config.get('retrieval_mode', 'observation'),
+            )
+            # Attach to trajectory collector for experience-augmented rollouts
+            if traj_collector is not None:
+                traj_collector.step_experience_manager = self.step_experience_manager
+                print(f"[FORGE] Step experience manager attached to trajectory collector")
+            # Distillation manager (optional, can be disabled)
+            self.forge_distillation_manager = ForgeDistillationManager(
+                library=self.experience_library,
+                divergence_type=forge_config.get('divergence_type', 'jsd'),
+                temperature=forge_config.get('distill_temperature', 1.0),
+                top_k_golden=forge_config.get('top_k_golden', 3),
+                top_k_warning=forge_config.get('top_k_warning', 2),
+            )
+            self.forge_epoch = 0
+            self.forge_use_distillation = forge_config.get('use_distillation', False)  # Default: disabled
+            print(f"[FORGE] Initialized with golden_capacity={forge_config.get('golden_capacity_per_level', 100)}, "
+                  f"step_retrieval=enabled, distillation={self.forge_use_distillation}")
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -1114,7 +1261,15 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
-                    
+
+                    # FORGE also uses step rewards for GiGPO-compatible multi-level advantages
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.FORGE:
+                        step_rewards_tensor = core_forge.compute_step_discounted_returns(
+                            batch=batch,
+                            gamma=self.config.algorithm.gamma
+                        )
+                        batch.batch['step_rewards'] = step_rewards_tensor
+
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1218,6 +1373,31 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
+                        # Prepare Cyclic-FLEX specific kwargs
+                        cyclic_flex_kwargs = {}
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.CYCLIC_FLEX:
+                            cyclic_config = self.config.algorithm.get('cyclic_flex', {})
+                            cyclic_flex_kwargs = {
+                                'cyclic_flex_use_step_rewards': cyclic_config.get('use_step_rewards', True),
+                                'cyclic_flex_step_advantage_w': cyclic_config.get('step_advantage_w', 1.0),
+                                'cyclic_flex_norm_by_std': cyclic_config.get('norm_by_std', True),
+                                'cyclic_flex_enable_similarity': cyclic_config.get('enable_similarity', False),
+                                'cyclic_flex_similarity_thresh': cyclic_config.get('similarity_thresh', 0.95),
+                            }
+
+                        # Prepare FORGE specific kwargs
+                        forge_kwargs = {}
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.FORGE:
+                            forge_config = self.config.algorithm.get('forge', {})
+                            forge_kwargs = {
+                                'forge_use_step_rewards': forge_config.get('use_step_rewards', True),
+                                'forge_step_advantage_w': forge_config.get('step_advantage_w', 1.0),
+                                'forge_norm_by_std': forge_config.get('norm_by_std', True),
+                                'forge_mode': forge_config.get('mode', 'mean_norm'),
+                                'forge_enable_similarity': forge_config.get('enable_similarity', False),
+                                'forge_similarity_thresh': forge_config.get('similarity_thresh', 0.95),
+                            }
+
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1231,8 +1411,10 @@ class RayPPOTrainer:
                             pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
                             step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
                             gigpo_mode=self.config.algorithm.gigpo.mode,
-                            gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
+                            gigpo_enable_similarity=self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            **cyclic_flex_kwargs,
+                            **forge_kwargs,
                         )
 
                     # update critic
@@ -1250,6 +1432,244 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    # ============= CYCLIC-FLEX: Wake Phase Experience Collection & Sleep Phase =============
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.CYCLIC_FLEX:
+                        cyclic_config = self.config.algorithm.get('cyclic_flex', {})
+
+                        # Wake Phase: Collect experiences from this batch
+                        with _timer("cyclic_flex_wake", timing_raw):
+                            scores = batch.batch['token_level_scores'].sum(dim=-1)
+
+                            # === Wake Phase Metrics ===
+                            # Get unique trajectories for proper episode-level stats
+                            unique_traj_uid, unique_idx = np.unique(
+                                batch.non_tensor_batch['traj_uid'], return_index=True
+                            )
+                            episode_scores = scores[unique_idx]
+
+                            # Compute wake phase reward statistics
+                            wake_reward_mean = episode_scores.mean().item()
+                            wake_reward_std = episode_scores.std().item() if len(episode_scores) > 1 else 0.0
+                            wake_reward_max = episode_scores.max().item()
+                            wake_reward_min = episode_scores.min().item()
+
+                            # Compute success rate if available
+                            wake_success_rate = None
+                            for k in batch.non_tensor_batch.keys():
+                                if 'success_rate' in k:
+                                    wake_success_rate = batch.non_tensor_batch[k][unique_idx].mean().item()
+                                    break
+
+                            # Compute positive/negative experience ratio
+                            num_positive = (episode_scores > 0).sum().item()
+                            num_total = len(episode_scores)
+                            positive_ratio = num_positive / num_total if num_total > 0 else 0.0
+
+                            # Generate reflections for high-scoring trajectories
+                            reflections = self.reflection_generator.generate_reflections(
+                                batch=batch,
+                                scores=scores,
+                                tokenizer=self.tokenizer,
+                            )
+
+                            # Add experiences to buffer
+                            num_added = self.experience_buffer.add_from_batch(
+                                batch=batch,
+                                reflections=reflections,
+                                scores=scores,
+                                env_name=self.config.env.env_name,
+                            )
+
+                            # Log comprehensive wake phase metrics
+                            buffer_stats = self.experience_buffer.get_statistics()
+                            wake_metrics = {
+                                # Wake phase rollout statistics
+                                'cyclic_flex/wake/reward_mean': wake_reward_mean,
+                                'cyclic_flex/wake/reward_std': wake_reward_std,
+                                'cyclic_flex/wake/reward_max': wake_reward_max,
+                                'cyclic_flex/wake/reward_min': wake_reward_min,
+                                'cyclic_flex/wake/positive_ratio': positive_ratio,
+                                'cyclic_flex/wake/num_trajectories': num_total,
+                                'cyclic_flex/wake/num_reflections': len(reflections) if reflections else 0,
+                                # Buffer state
+                                'cyclic_flex/buffer_size': buffer_stats['size'],
+                                'cyclic_flex/buffer_utilization': buffer_stats['utilization'],
+                                'cyclic_flex/experiences_added': num_added,
+                            }
+                            if wake_success_rate is not None:
+                                wake_metrics['cyclic_flex/wake/success_rate'] = wake_success_rate
+                            # Buffer score statistics
+                            if 'avg_score' in buffer_stats:
+                                wake_metrics['cyclic_flex/buffer_avg_score'] = buffer_stats['avg_score']
+                            if 'min_score' in buffer_stats:
+                                wake_metrics['cyclic_flex/buffer_min_score'] = buffer_stats['min_score']
+                            if 'max_score' in buffer_stats:
+                                wake_metrics['cyclic_flex/buffer_max_score'] = buffer_stats['max_score']
+                            metrics.update(wake_metrics)
+
+                            # Print wake phase summary for visibility
+                            print(f"[Cyclic-FLEX Wake] Step {self.global_steps}: "
+                                  f"reward={wake_reward_mean:.3f}±{wake_reward_std:.3f}, "
+                                  f"positive_ratio={positive_ratio:.2%}, "
+                                  f"buffer={buffer_stats['size']}/{self.experience_buffer.capacity}")
+
+                        # Sleep Phase: Check if consolidation should be triggered
+                        consolidation_freq = cyclic_config.get('consolidation_freq', 0)
+                        min_experiences = cyclic_config.get('min_positive_experiences', 10)
+                        max_cycles = cyclic_config.get('max_cycles', 10)
+
+                        should_sleep = (
+                            (self.experience_buffer.is_full() or
+                             (consolidation_freq > 0 and self.global_steps % consolidation_freq == 0)) and
+                            len(self.experience_buffer) >= min_experiences and
+                            self.sleep_cycle_count < max_cycles
+                        )
+
+                        if should_sleep:
+                            print(f"\n{'='*60}")
+                            print(f"[Cyclic-FLEX] SLEEP PHASE TRIGGERED (Cycle {self.sleep_cycle_count + 1})")
+                            print(f"  Buffer size: {len(self.experience_buffer)}/{self.experience_buffer.capacity}")
+                            print(f"{'='*60}\n")
+
+                            with _timer("cyclic_flex_sleep", timing_raw):
+                                # Prepare dataset from buffer
+                                sleep_dataloader = self.sleep_trainer.prepare_dataloader(
+                                    buffer=self.experience_buffer,
+                                    tokenizer=self.tokenizer,
+                                )
+
+                                if sleep_dataloader is not None:
+                                    # Prepare SFT data from the dataloader
+                                    sleep_data = self.experience_buffer.to_sft_dataset(self.tokenizer)
+
+                                    if sleep_data['input_ids'].numel() > 0:
+                                        # Pad data to be divisible by number of workers
+                                        n_gpus = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+                                        batch_size = sleep_data['input_ids'].shape[0]
+
+                                        if batch_size % n_gpus != 0:
+                                            # Pad to next multiple of n_gpus
+                                            pad_size = n_gpus - (batch_size % n_gpus)
+                                            for key in ['input_ids', 'attention_mask', 'labels']:
+                                                # Repeat last samples to pad
+                                                padding = sleep_data[key][-1:].repeat(pad_size, 1)
+                                                sleep_data[key] = torch.cat([sleep_data[key], padding], dim=0)
+                                            print(f"[Cyclic-FLEX] Padded sleep data from {batch_size} to {sleep_data['input_ids'].shape[0]} for {n_gpus} GPUs")
+
+                                        # Create DataProto for worker
+                                        sleep_batch = DataProto.from_dict(
+                                            tensors={
+                                                'input_ids': sleep_data['input_ids'],
+                                                'attention_mask': sleep_data['attention_mask'],
+                                                'labels': sleep_data['labels'],
+                                            },
+                                            meta_info={
+                                                'sleep_lr': cyclic_config.get('learning_rate', 1e-6),
+                                                'sleep_epochs': cyclic_config.get('sleep_epochs', 2),
+                                            }
+                                        )
+
+                                        # Run SFT on the distributed workers
+                                        print(f"[Cyclic-FLEX] Running sleep SFT on {len(sleep_data['input_ids'])} experiences...")
+                                        try:
+                                            sleep_output = self.actor_rollout_wg.run_sleep_sft(sleep_batch)
+                                            sleep_metrics = reduce_metrics(sleep_output.meta_info.get("metrics", {}))
+                                            metrics.update(sleep_metrics)
+                                            print(f"[Cyclic-FLEX] Sleep SFT complete. Loss: {sleep_metrics.get('sleep/train_loss', 'N/A')}")
+                                        except Exception as e:
+                                            print(f"[Cyclic-FLEX] Sleep SFT failed: {e}")
+                                            metrics['cyclic_flex/sleep_error'] = 1
+
+                                    # Log sleep phase metrics
+                                    metrics.update({
+                                        'cyclic_flex/sleep_triggered': 1,
+                                        'cyclic_flex/sleep_cycle': self.sleep_cycle_count + 1,
+                                        'cyclic_flex/sleep_num_experiences': len(self.experience_buffer),
+                                    })
+
+                                    # Save buffer checkpoint before flushing
+                                    buffer_checkpoint_path = os.path.join(
+                                        cyclic_config.get('checkpoint_dir', 'checkpoints/cyclic_flex'),
+                                        f"buffer_cycle_{self.sleep_cycle_count + 1}.pkl"
+                                    )
+                                    os.makedirs(os.path.dirname(buffer_checkpoint_path), exist_ok=True)
+                                    self.experience_buffer.save_checkpoint(buffer_checkpoint_path)
+
+                                    # Flush buffer after consolidation
+                                    flushed_count = self.experience_buffer.flush()
+                                    self.sleep_cycle_count += 1
+
+                                    print(f"[Cyclic-FLEX] Sleep Phase Complete. Flushed {flushed_count} experiences.")
+                                    print(f"[Cyclic-FLEX] Buffer checkpoint saved to {buffer_checkpoint_path}\n")
+                    # ============= END CYCLIC-FLEX =============
+
+                    # ============= FORGE: Experience Evolution Phase =============
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.FORGE:
+                        forge_config = self.config.algorithm.get('forge', {})
+
+                        with _timer("forge_evolution", timing_raw):
+                            scores = batch.batch['token_level_scores'].sum(dim=-1)
+
+                            # Get unique trajectories
+                            unique_traj_uid, unique_idx = np.unique(
+                                batch.non_tensor_batch['traj_uid'], return_index=True
+                            )
+                            episode_scores = scores[unique_idx]
+
+                            # Compute statistics
+                            forge_reward_mean = episode_scores.mean().item()
+                            forge_reward_std = episode_scores.std().item() if len(episode_scores) > 1 else 0.0
+                            num_positive = (episode_scores > forge_config.get('success_threshold', 0.5)).sum().item()
+                            num_total = len(episode_scores)
+                            positive_ratio = num_positive / num_total if num_total > 0 else 0.0
+
+                            # Evolve experience library (forward learning, NO gradient updates)
+                            evolution_stats = evolve_library_from_batch(
+                                library=self.experience_library,
+                                batch=batch,
+                                scores=scores,
+                                tokenizer=self.tokenizer,
+                                success_threshold=forge_config.get('success_threshold', 0.5),
+                                task_type=self.config.env.env_name,
+                            )
+
+                            # Get library statistics
+                            library_stats = self.experience_library.get_statistics()
+
+                            # Log FORGE metrics
+                            forge_metrics = {
+                                'forge/reward_mean': forge_reward_mean,
+                                'forge/reward_std': forge_reward_std,
+                                'forge/positive_ratio': positive_ratio,
+                                'forge/num_trajectories': num_total,
+                                'forge/strategies_added': evolution_stats.get('strategies_added', 0),
+                                'forge/warnings_added': evolution_stats.get('warnings_added', 0),
+                                'forge/library_golden_size': library_stats.get('golden_size', 0),
+                                'forge/library_warning_size': library_stats.get('warning_size', 0),
+                                'forge/library_total_size': library_stats.get('total_size', 0),
+                            }
+                            metrics.update(forge_metrics)
+
+                            # Print FORGE summary
+                            print(f"[FORGE Evolution] Step {self.global_steps}: "
+                                  f"reward={forge_reward_mean:.3f}±{forge_reward_std:.3f}, "
+                                  f"positive_ratio={positive_ratio:.2%}, "
+                                  f"library_size={library_stats.get('total_size', 0)}")
+
+                        # Save library checkpoint periodically
+                        save_freq = forge_config.get('library_save_freq', 10)
+                        if save_freq > 0 and self.global_steps % save_freq == 0:
+                            checkpoint_dir = forge_config.get('checkpoint_dir', 'checkpoints/forge')
+                            library_path = os.path.join(checkpoint_dir, f"library_step_{self.global_steps}.pkl")
+                            self.experience_library.save(library_path)
+
+                        self.forge_epoch += 1
+
+                        # Update step counter for warmup tracking
+                        if hasattr(self, 'step_experience_manager'):
+                            self.step_experience_manager.current_step = self.forge_epoch
+                    # ============= END FORGE =============
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

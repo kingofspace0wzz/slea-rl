@@ -1,0 +1,28 @@
+services:
+  verl-agent-exp:
+    build:
+      context: .
+      dockerfile: Dockerfile.sglang
+    image: verl-agent-exp:latest
+    
+    # --- NEW: SHARED MEMORY SETTINGS ---
+    # option 1: Share the host's IPC namespace (Recommended for PyTorch)
+    ipc: host
+    # option 2: Explicitly set a large size (Optional if ipc: host is used, but good safety)
+    shm_size: '32gb'
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    volumes:
+      - ..:/app/workspace
+      - /home/ubuntu/.cache/huggingface:/root/.cache/huggingface
+    
+    tty: true
+    stdin_open: true
+    command: bash

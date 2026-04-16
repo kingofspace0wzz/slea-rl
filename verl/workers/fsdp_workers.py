@@ -641,6 +641,118 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def run_sleep_sft(self, data: DataProto):
+        """Run SFT-style training for Cyclic-FLEX sleep phase consolidation.
+
+        This method performs supervised fine-tuning on successful experiences
+        accumulated during the wake phase. It uses a low learning rate to avoid
+        catastrophic forgetting.
+
+        Args:
+            data: DataProto containing:
+                - input_ids: Tokenized inputs (batch_size, seq_len)
+                - attention_mask: Attention mask (batch_size, seq_len)
+                - labels: Target labels with -100 for masked positions (batch_size, seq_len)
+                - meta_info['sleep_lr']: Optional learning rate override
+                - meta_info['sleep_epochs']: Number of epochs to train
+
+        Returns:
+            DataProto with training metrics
+        """
+        data = data.to(get_torch_device().current_device())
+
+        assert self._is_actor, "Sleep SFT requires actor model"
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
+
+        # Get sleep phase parameters
+        sleep_lr = data.meta_info.get('sleep_lr', 1e-6)  # Very low LR by default
+        sleep_epochs = data.meta_info.get('sleep_epochs', 1)
+
+        # Extract tensors
+        input_ids = data.batch['input_ids']
+        attention_mask = data.batch['attention_mask']
+        labels = data.batch['labels']
+
+        batch_size = input_ids.shape[0]
+        metrics = {
+            'sleep/batch_size': batch_size,
+            'sleep/epochs': sleep_epochs,
+            'sleep/learning_rate': sleep_lr,
+        }
+
+        if batch_size == 0:
+            metrics['sleep/skipped'] = True
+            output = DataProto(meta_info={"metrics": metrics})
+            return output.to("cpu")
+
+        # Store original LR and temporarily set sleep LR
+        original_lrs = []
+        for param_group in self.actor_optimizer.param_groups:
+            original_lrs.append(param_group['lr'])
+            param_group['lr'] = sleep_lr
+
+        self.actor_module_fsdp.train()
+        total_loss = 0.0
+        num_steps = 0
+
+        try:
+            for epoch in range(sleep_epochs):
+                # Forward pass
+                outputs = self.actor_module_fsdp(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = outputs.loss
+
+                # Backward pass
+                self.actor_optimizer.zero_grad()
+                loss.backward()
+
+                # Gradient clipping
+                if hasattr(self, 'config') and hasattr(self.config.actor, 'clip_grad'):
+                    torch.nn.utils.clip_grad_norm_(
+                        self.actor_module_fsdp.parameters(),
+                        self.config.actor.clip_grad
+                    )
+
+                self.actor_optimizer.step()
+
+                total_loss += loss.item()
+                num_steps += 1
+
+            avg_loss = total_loss / max(num_steps, 1)
+            metrics.update({
+                'sleep/train_loss': avg_loss,
+                'sleep/num_steps': num_steps,
+                'sleep/skipped': False,
+            })
+
+        except Exception as e:
+            print(f"[Sleep SFT] Error during training: {e}")
+            metrics['sleep/error'] = str(e)
+            metrics['sleep/skipped'] = True
+
+        finally:
+            # Restore original learning rates
+            for param_group, orig_lr in zip(self.actor_optimizer.param_groups, original_lrs):
+                param_group['lr'] = orig_lr
+
+        output = DataProto(meta_info={"metrics": metrics})
+        output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         # Support all hardwares
         prompts = prompts.to(get_torch_device().current_device())

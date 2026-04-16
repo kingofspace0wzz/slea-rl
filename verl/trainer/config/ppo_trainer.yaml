@@ -252,6 +252,48 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+  forge:
+    use_step_rewards: true
+    step_advantage_w: 1.0
+    mode: "mean_norm"
+    success_threshold: 0.5
+    golden_capacity_per_level: 100
+    warning_capacity_per_level: 50
+    divergence_type: "jsd"
+    distill_temperature: 1.0
+    library_save_freq: 10
+    checkpoint_dir: checkpoints/forge
+
+  cyclic_flex:  # Cyclic-FLEX: Wake-Sleep framework for continuous agent evolution
+    # Wake phase settings
+    use_step_rewards: true          # Enable GiGPO-style step-level advantages
+    step_advantage_w: 1.0           # Weight for step-level advantages
+    norm_by_std: true               # Normalize advantages by standard deviation
+    enable_similarity: false        # Use similarity-based grouping (vs exact match)
+    similarity_thresh: 0.95         # Threshold for similarity grouping
+    retrieval_k: 5                  # Experiences to retrieve for ICL context
+    # Sleep phase settings
+    buffer_capacity: 100            # C_MAX - triggers sleep when full
+    consolidation_freq: 0           # Steps between consolidation (0 = only trigger on buffer full)
+    min_positive_experiences: 10    # Minimum experiences before sleep is allowed
+    max_cycles: 10                  # Maximum number of sleep cycles
+    # Sleep training (LoRA)
+    sleep_epochs: 2                 # Training epochs per sleep cycle
+    sleep_batch_size: 4             # Batch size for sleep training
+    lora_rank: 16                   # LoRA rank
+    lora_alpha: 32                  # LoRA alpha
+    lora_dropout: 0.05              # LoRA dropout
+    learning_rate: 2.0e-5           # SFT learning rate
+    warmup_ratio: 0.1               # Warmup proportion
+    target_modules:                 # Modules to apply LoRA to
+      - q_proj
+      - v_proj
+    merge_after_training: true      # Merge LoRA into base model after sleep
+    # Reflection settings
+    use_llm_reflection: false       # Use LLM to generate reflections (slower but richer)
+    min_score_threshold: 0.0        # Minimum score for experience storage
+    # Checkpoint settings
+    checkpoint_dir: checkpoints/cyclic_flex
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10

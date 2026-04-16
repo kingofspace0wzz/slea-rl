@@ -132,3 +132,14 @@ data/
 .tmp
 *ports
 
+# Core dumps and tar archives
+core
+verl-agent-exp-latest.tar
+
+# Local practice files
+practice/*
+!practice/latex/
+practice/latex/*
+!practice/latex/colm/
+
+miniconda.sh

@@ -1,0 +1,80 @@
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies
+#   - openjdk-11: required by pyserini for Lucene search engine indexing
+#   - build-essential: required for compiling flash-attn and other native extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    wget \
+    curl \
+    openjdk-11-jdk \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    python3-venv \
+    build-essential \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+
+# Install Miniconda
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/conda && \
+    rm /tmp/miniconda.sh
+ENV PATH="/opt/conda/bin:$PATH"
+RUN conda init bash
+
+# Accept Anaconda ToS for default channels
+RUN conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+# Create the verl-agent-webshop conda env with Python 3.10 (WebShop requirement)
+# and auto-activate it on every shell login
+RUN conda create -n verl-agent-webshop python=3.10 -y
+RUN echo "conda activate verl-agent-webshop" >> /root/.bashrc
+# Make all subsequent RUN commands use the conda env's Python 3.10
+ENV PATH="/opt/conda/envs/verl-agent-webshop/bin:$PATH"
+
+# Wandb login
+RUN pip install wandb
+RUN wandb login 6e6f377b9c85f1a12f1322909e6e38195e1572d9
+
+WORKDIR /app/workspace
+COPY . .
+CMD ["bash"]
+
+# install webshop environment
+RUN cd /app/workspace/agent_system/environments/env_package/webshop/webshop && \
+    ./setup.sh -d all
+# resolve the spacy error
+RUN pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.7.1/en_core_web_lg-3.7.1.tar.gz
+RUN pip install https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz
+# setup.sh's "conda install faiss-cpu" went to the base env (conda ignores PATH),
+# so re-install into the correct env via pip
+RUN pip install faiss-cpu
+RUN cd /app/workspace/agent_system/environments/env_package/webshop/webshop/search_engine && \
+    mkdir -p resources resources_100 resources_1k resources_100k indexes indexes_100 indexes_1k indexes_100k && \
+    python convert_product_file_format.py && \
+    bash run_indexing.sh
+
+# Persist webshop data and indexes to /opt/ so they survive the volume mount
+RUN cp -a /app/workspace/agent_system/environments/env_package/webshop/webshop/data /opt/webshop-data && \
+    cp -a /app/workspace/agent_system/environments/env_package/webshop/webshop/search_engine/indexes /opt/webshop-indexes && \
+    cp -a /app/workspace/agent_system/environments/env_package/webshop/webshop/search_engine/indexes_1k /opt/webshop-indexes_1k && \
+    cp -a /app/workspace/agent_system/environments/env_package/webshop/webshop/search_engine/indexes_100 /opt/webshop-indexes_100 && \
+    cp -a /app/workspace/agent_system/environments/env_package/webshop/webshop/search_engine/indexes_100k /opt/webshop-indexes_100k
+
+# Install torch and flash-attn, vllm
+RUN pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+RUN pip install flash-attn==2.7.4.post1 --no-build-isolation -v
+RUN pip install -e .
+RUN pip install vllm==0.8.2
+
+# Entrypoint symlinks persisted data/indexes into the mounted workspace
+COPY docker-entrypoint-webshop.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint-webshop.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint-webshop.sh"]
